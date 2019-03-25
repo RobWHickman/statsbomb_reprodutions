@@ -176,7 +176,7 @@ p <- as.data.frame(pass_positions) %>%
              aes(label = last_name, x = x2, y = y2),
              size = 5, colour = "black", nudge_x = 2, nudge_y = 2) +
   geom_text(data = subs, aes(label = paste0(team.name, "\nuntil ", round(earliest_sub), "'")),
-            x = 110, y = 50, size = 8) +
+            x = 108, y = 50, size = 7) +
   geom_segment(data = play_direction_arrow,
                aes(x = x, xend = xend, y = y, yend = y),
                size = 2, colour = "grey", arrow =  arrow(length = unit(1, "cm"))) +
