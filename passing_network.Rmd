@@ -1,0 +1,192 @@
+---
+title: "passing_network"
+output: html_document
+---
+
+```{r libraries, warning=FALSE,message=FALSE}
+library(StatsBombR)
+library(tidyverse)
+library(data.table)
+library(lubridate)
+library(ggsoccer)
+library(data.table)
+library(ggrepel)
+```
+
+```{r get_matches_data, warning=FALSE,message=FALSE}
+wsl_matches <- StatsBombR::FreeCompetitions() %>%
+  #only interested in WSL
+  filter(competition_name == "FA Women's Super League") %>%
+  #find free matches from WSL
+  #(all matches played so far)
+  select(competition_id) %>%
+  StatsBombR::FreeMatches(.) %>%
+  #only want info that helps us predict scores
+  select(match_id,
+         competition.competition_id,
+         season.season_id,
+         home = home_team.home_team_name,
+         away = away_team.away_team_name,
+         hgoals = home_score,
+         agoals = away_score)
+
+
+```
+```{r get_match_data, warning=FALSE,message=FALSE}
+wsl_game <- wsl_matches %>%
+  #split match info into separate rows
+  split(f = 1:nrow(.)) %>%
+  #select a game
+  .[[34]] %>%
+  StatsBombR::get.matchFree() %>%
+  mutate(game_time = case_when(
+    period == 1 ~ hms(timestamp),
+    period == 2 ~ hms(timestamp) + hms(max(wsl_game$timestamp[which(wsl_game$period == 1)]))
+  )) %>%
+  mutate(game_time = as.numeric(game_time)/ 60)
+
+```
+```{r plot_pitch, warning=FALSE,message=FALSE}
+p <- ggplot() +
+  annotate_pitch() +
+  theme_void() 
+
+plot(p)
+```
+
+
+```{r get_startin_xi}
+starting_players <- wsl_game %>%
+  select(tactics.lineup) %>%
+  .[1:2,] %>%
+  do.call(rbind, .) %>%
+  select(player.id, player.name) 
+
+```
+
+
+```{r get_team_subs, warning=FALSE,message=FALSE}
+subs <- wsl_game %>%
+  select(team.id, team.name, game_time, period, substitution.outcome.id) %>%
+  filter(!is.na(substitution.outcome.id))  %>%
+  group_by(team.id, team.name) %>%
+  summarise(earliest_sub = min(game_time))
+
+pre_sub_data <- wsl_game %>%
+  merge(., subs, by = "team.id") %>%
+  filter(game_time < earliest_sub)
+```
+
+
+```{r average_positions, warning=FALSE,message=FALSE}
+pass_positions <- wsl_game %>%
+  select(team.id, team.name, player.id, type.name, location) %>%
+  #filter(type.name == "Pass") %>%
+  separate(col = location, into = c("delete", "x", "y")) %>%
+  select(-delete) %>%
+  group_by(player.id, team.id, team.name) %>%
+  summarise(x = mean(as.numeric(x), na.rm = TRUE),
+            y = mean(as.numeric(y), na.rm = TRUE),
+            events = n()) %>%
+  filter(player.id %in% starting_players$player.id) %>%
+  merge(., starting_players, by = "player.id") %>%
+  mutate(last_name = gsub(".* ", "", player.name)) %>%
+  setDT() %>%
+  .[, events_perc := events / sum(events)] %>%
+  .[team.id != first(team.id), x := 120 - x] %>%
+  mutate(x2 = x/1.2, y2 = y / 0.8) %>%
+  select(player.id, last_name, team.name, x2, y2, events_perc)
+
+```
+
+```{r}
+p <- as.data.frame(pass_positions) %>%
+  ggplot(., aes(x = x2, y = y2, size = events_perc, colour = team.name)) +
+  annotate_pitch() +
+  geom_point(alpha = 0.5) +
+  geom_text(aes(label = last_name)) +
+  scale_colour_manual(values = c("blue", "maroon"), guide = FALSE) +
+  scale_size_continuous(range = c(5,10), guide = FALSE) +
+  facet_wrap(~team.name) +
+  coord_flip(xlim = c(0,100), ylim = c(0,100), clip = "on") +
+  theme_void()
+
+```
+
+```{r}
+pass_network <- wsl_game %>%
+  select(team.id, team.name, player.id, type.name, related_events) %>%
+  filter(type.name == "Pass") 
+
+pass_network %<>% merge(., 
+  pass_network %>%
+    split(f = seq(nrow(.))) %>%
+    lapply(., function(pass){
+      end_pass <- wsl_game %>%
+        filter(id %in% unlist(pass$related_events)) %>%
+        filter(grepl("Receipt", type.name)) %>%
+        select(team.name, type.name, player.id)
+      
+      if(nrow(end_pass) == 1) {
+        df <- data.frame(receiver = end_pass$player.id)
+        return(df)
+      } else if(nrow(end_pass) == 0) {
+        return(NULL)
+      } else {
+        warning("unexpected number of rows")
+      }
+    }) %>%
+    do.call(rbind, .),
+  by = "row.names") %>%
+  select(player.id, receiver) %>%
+  group_by(player.id, receiver) %>%
+  summarise(passes = n()) %>%
+  filter(player.id %in% starting_players$player.id &
+           receiver %in% starting_players$player.id) %>%
+  merge(., pass_positions, by = "player.id") %>%
+  setDT() %>%
+  .[, pass_perc := passes / sum(passes), by = player.id] %>%
+  merge(., 
+        select(pass_positions, receiver = player.id, rx2 = x2, ry2 = y2),
+        by = "receiver") %>%
+  select(team.name, x2, y2, rx2, ry2, pass_perc) %>%
+  filter(pass_perc > 0.125)
+
+```
+
+```{r}
+play_direction_arrow <- data.frame(x = c(5, 95),
+                                   xend = c(25, 75),
+                                   y = 90, 10) %>%
+  mutate(team.name = unique(pass_positions$team.name))
+```
+
+
+```{r}
+p <- as.data.frame(pass_positions) %>%
+  ggplot() +
+  annotate_pitch() +
+  geom_segment(data = pass_network,
+    aes(x = x2, y = y2, xend = rx2, yend = ry2),
+    alpha = 0.3, colour = "black", size = 3, arrow = arrow(length = unit(0.1, "inches"))) +
+  geom_point(data = pass_positions,
+             aes(fill = team.name, size = events_perc, x = x2, y = y2),
+             alpha = 1, colour = "black", shape = 21, stroke = 1.5) +
+  geom_label_repel(data = pass_positions,
+             aes(label = last_name, x = x2, y = y2),
+             size = 5, colour = "black", nudge_x = 2, nudge_y = 2) +
+  geom_text(data = subs, aes(label = paste0(team.name, "\nuntil ", round(earliest_sub), "'")),
+            x = 110, y = 50, size = 8) +
+  geom_segment(data = play_direction_arrow,
+               aes(x = x, xend = xend, y = y, yend = y),
+               size = 2, colour = "grey", arrow =  arrow(length = unit(1, "cm"))) +
+  scale_fill_manual(values = c("#003399", "#540D1A"), guide = FALSE) +
+  scale_size_continuous(range = c(10,20), guide = FALSE) +
+  facet_wrap(~team.name) +
+  coord_flip(xlim = c(0,110), ylim = c(0,100), clip = "on") +
+  theme_void() +
+  theme(strip.text.x = element_blank())
+
+
+```
+
